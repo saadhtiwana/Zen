@@ -1,132 +1,103 @@
-import express from 'express'
-import dotenv from 'dotenv'
-import cookieParser from 'cookie-parser'
-import { createServer } from 'http'
-import { Server } from 'socket.io'
-import authRoutes from './routes/auth.route.js';
-import connectToMongoDb from './db/connectToMongoDb.js';
-import messageRoutes from './routes/message.route.js';
-import userRoutes from './routes/user.route.js';
-import Message from './models/message.model.js';
-import Conversation from './models/conversation.model.js';
+import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
 
-//variables
-dotenv.config()
-const app = express()
-const server = createServer(app)
+const app = express();
+const server = createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5174",
-    credentials: true
+    origin: "*",
+    methods: ["GET", "POST"]
   }
-})
-const PORT = process.env.PORT
+});
 
-// Store online users
-const onlineUsers = new Map() // userId -> socketId
-const userSockets = new Map() // socketId -> userId 
 
-app.use(express.json()) // Middleware to parse JSON bodies (req.body)
-app.use(cookieParser()) // Middleware to parse cookies (req.cookies)
+app.use(cors());
+app.use(express.json());
 
-//Defining the use of appRoutes
-app.use('/api/auth',authRoutes);
-app.use('/api/messages',messageRoutes);
-app.use('/api/users',userRoutes);
+const rooms = new Map();
+const users = new Map();
 
-// Socket.IO connection handling
+app.get('/', (req, res) => {
+  res.send('Chatroom Server Running!');
+});
+
+
+
+
+//This handles socket connections; JOINING
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id)
-  
-  const userId = socket.handshake.query.userId
-  if (userId && userId !== 'undefined') {
-    onlineUsers.set(userId, socket.id)
-    userSockets.set(socket.id, userId)
-    
-    // Broadcast updated online users list
-    io.emit('getOnlineUsers', Array.from(onlineUsers.keys()))
-  }
-  
-  // Handle sending messages
-  socket.on('sendMessage', async ({ receiverId, message }) => {
-    try {
-      console.log('Socket message received:', { senderId: userId, receiverId, message })
-      
-      // Save message to database
-      let conversation = await Conversation.findOne({
-        participants: { $all: [userId, receiverId] }
-      })
-      
-      if (!conversation) {
-        conversation = await Conversation.create({
-          participants: [userId, receiverId]
-        })
-      }
-      
-      const newMessage = new Message({
-        senderId: userId,
-        receiverId,
-        message
-      })
-      
-      await newMessage.save()
-      
-      if (newMessage) {
-        conversation.messages.push(newMessage._id)
-        await conversation.save()
-        
-        const messageData = {
-          _id: newMessage._id,
-          senderId: userId,
-          receiverId,
-          message,
-          createdAt: newMessage.createdAt
-        }
-        
-        // Send to receiver if online
-        const receiverSocketId = onlineUsers.get(receiverId)
-        if (receiverSocketId) {
-          io.to(receiverSocketId).emit('newMessage', messageData)
-        }
-        
-        // Send back to sender for confirmation
-        socket.emit('messageConfirmed', messageData)
-      }
-    } catch (error) {
-      console.error('Error handling socket message:', error)
-      socket.emit('messageError', { error: 'Failed to send message' })
-    }
-  })
-  
-  // Handle typing indicators
-  socket.on('typing', ({ receiverId, isTyping, username }) => {
-    const receiverSocketId = onlineUsers.get(receiverId)
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('userTyping', {
-        userId,
-        username,
-        isTyping
-      })
-    }
-  })
-  
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id)
-    const userId = userSockets.get(socket.id)
-    if (userId) {
-      onlineUsers.delete(userId)
-      userSockets.delete(socket.id)
-      
-      // Broadcast updated online users list
-      io.emit('getOnlineUsers', Array.from(onlineUsers.keys()))
-    }
-  })
-})
+  console.log('User connected:', socket.id);
 
-// Starting the server and connecting to MongoDB
+  socket.on('join-room', (data) => {
+    const { username, roomName } = data;
+    users.set(socket.id, { username, currentRoom: roomName });
+    if (!rooms.has(roomName)) {
+      rooms.set(roomName, { users: new Set(), messages: [] });
+    }
+    const room = rooms.get(roomName);
+    room.users.add(socket.id);
+    socket.join(roomName);
+    socket.emit('room-joined', {
+      roomName,
+      message: `Welcome to ${roomName}!`,
+      userCount: room.users.size
+    });
+    socket.to(roomName).emit('user-joined', {
+      username,
+      message: `${username} joined the room`
+    });
+    console.log(`${username} joined room: ${roomName}`);
+  });
+
+
+
+  //This handles sending messages in the chatroom
+  socket.on('send-message', (data) => {
+    const user = users.get(socket.id);
+    if (!user) return;
+    const { message } = data;
+    const { username, currentRoom } = user;
+    const messageData = {
+      id: Date.now(),
+      username,
+      message,
+      timestamp: new Date().toLocaleTimeString()
+    };
+    const room = rooms.get(currentRoom);
+    if (room) {
+      room.messages.push(messageData);
+    }
+    io.to(currentRoom).emit('receive-message', messageData);
+    console.log(`Message in ${currentRoom} by ${username}: ${message}`);
+  });
+
+  //This handles leaving the chatroom
+  socket.on('disconnect', () => {
+    const user = users.get(socket.id);
+    if (user) {
+      const { username, currentRoom } = user;
+      const room = rooms.get(currentRoom);
+      if (room) {
+        room.users.delete(socket.id);
+        if (room.users.size === 0) {
+          rooms.delete(currentRoom);
+        } else {
+          socket.to(currentRoom).emit('user-left', {
+            username,
+            message: `${username} left the room`
+          });
+        }
+      }
+      users.delete(socket.id);
+      console.log(`${username} disconnected`);
+    }
+  });
+});
+
+const PORT = 3000;
 server.listen(PORT, () => {
-  connectToMongoDb();
-  console.log("MONGO_URI:", process.env.MONGO_URI);
-  console.log(`Server is running at http://localhost:${PORT}`)
-})
+  console.log(`Server running on http://localhost:${PORT}`);
+});
